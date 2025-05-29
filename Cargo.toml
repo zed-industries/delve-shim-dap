@@ -1,7 +1,9 @@
 [package]
 name = "delve-shim-dap"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+authors = ["Zed Team <hi@zed.dev>"]
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1"
