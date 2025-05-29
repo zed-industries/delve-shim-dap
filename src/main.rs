@@ -1,18 +1,30 @@
-use debugserver_types::*;
-use serde_json::Value;
+//! DAP Shim Server
+//!
+//! This is a Debug Adapter Protocol (DAP) shim that acts as a middleman between a DAP client
+//! and a subprocess DAP server. It handles the initialize request, spawns a subprocess via
+//! runInTerminal, and then proxies all subsequent DAP messages between the client and subprocess.
+//!
+//! Key features:
+//! - Communicates with client via stdin/stdout
+//! - Responds to initialize request with DAP capabilities
+//! - Sends initialized event and runInTerminal request to spawn subprocess
+//! - Buffers requests that arrive before subprocess is ready
+//! - Forwards all subsequent requests to subprocess DAP via TCP on port 4712
+//! - Proxies responses back from subprocess to client
+
+use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
 #[derive(Debug)]
 struct DapShim {
     seq: i64,
-    client_writer: Option<tokio::net::tcp::OwnedWriteHalf>,
-    subdap_stream: Option<TcpStream>,
-    buffered_requests: VecDeque<Request>,
+    subdap_writer: Option<tokio::net::tcp::OwnedWriteHalf>,
+    buffered_requests: VecDeque<Value>,
     initialized: bool,
 }
 
@@ -20,8 +32,7 @@ impl DapShim {
     fn new() -> Self {
         Self {
             seq: 0,
-            client_writer: None,
-            subdap_stream: None,
+            subdap_writer: None,
             buffered_requests: VecDeque::new(),
             initialized: false,
         }
@@ -32,8 +43,11 @@ impl DapShim {
         self.seq
     }
 
-    async fn send_to_client(&mut self, msg: &Value) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(writer) = &mut self.client_writer {
+    async fn send_to_subdap(
+        &mut self,
+        msg: &Value,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(writer) = &mut self.subdap_writer {
             let msg_bytes = serde_json::to_vec(msg)?;
             writer
                 .write_all(format!("Content-Length: {}\r\n\r\n", msg_bytes.len()).as_bytes())
@@ -44,66 +58,55 @@ impl DapShim {
         Ok(())
     }
 
-    async fn handle_initialize(&mut self, req: Request) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_initialize(
+        &mut self,
+        request: Value,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let seq = request["seq"].as_i64().unwrap_or(0);
+
         // Send initialize response
-        let capabilities = Capabilities {
-            supports_configuration_done_request: Some(true),
-            supports_conditional_breakpoints: Some(true),
-            supports_delayed_stack_trace_loading: Some(true),
-            supports_function_breakpoints: Some(true),
-            supports_instruction_breakpoints: Some(true),
-            supports_exception_info_request: Some(true),
-            supports_set_variable: Some(true),
-            supports_evaluate_for_hovers: Some(true),
-            supports_clipboard_context: Some(true),
-            supports_stepping_granularity: Some(true),
-            supports_log_points: Some(true),
-            supports_disassemble_request: Some(true),
-            supports_step_back: Some(false),
-            support_terminate_debuggee: Some(false),
-            supports_terminate_request: Some(false),
-            supports_restart_request: Some(false),
-            supports_set_expression: Some(false),
-            supports_loaded_sources_request: Some(false),
-            supports_read_memory_request: Some(false),
-            supports_cancel_request: Some(false),
-            supports_hit_conditional_breakpoints: Some(false),
-            exception_breakpoint_filters: Some(vec![]),
-            supports_restart_frame: Some(false),
-            supports_goto_targets_request: Some(false),
-            supports_step_in_targets_request: Some(false),
-            supports_completions_request: Some(false),
-            supports_modules_request: Some(false),
-            additional_module_columns: Some(vec![]),
-            supported_checksum_algorithms: Some(vec![]),
-            supports_exception_options: Some(false),
-            supports_value_formatting_options: Some(false),
-            supports_terminate_threads_request: Some(false),
-            supports_data_breakpoints: Some(false),
-        };
+        let response = json!({
+            "seq": self.next_seq(),
+            "type": "response",
+            "request_seq": seq,
+            "success": true,
+            "command": "initialize",
+            "body": {
+                "supportsConfigurationDoneRequest": true,
+                "supportsConditionalBreakpoints": true,
+                "supportsDelayedStackTraceLoading": true,
+                "supportsFunctionBreakpoints": true,
+                "supportsInstructionBreakpoints": true,
+                "supportsExceptionInfoRequest": true,
+                "supportsSetVariable": true,
+                "supportsEvaluateForHovers": true,
+                "supportsClipboardContext": true,
+                "supportsSteppingGranularity": true,
+                "supportsLogPoints": true,
+                "supportsDisassembleRequest": true,
+                "supportsStepBack": false,
+                "supportTerminateDebuggee": false,
+                "supportsTerminateRequest": false,
+                "supportsRestartRequest": false,
+                "supportsSetExpression": false,
+                "supportsLoadedSourcesRequest": false,
+                "supportsReadMemoryRequest": false,
+                "supportsCancelRequest": false
+            }
+        });
 
-        let response = Response {
-            seq: self.next_seq(),
-            type_: "response".to_string(),
-            request_seq: req.seq,
-            success: true,
-            command: req.command.clone(),
-            message: None,
-            body: Some(serde_json::to_value(capabilities).unwrap()),
-        };
-
-        self.send_to_client(&serde_json::to_value(response)?).await?;
+        send_dap_message_stdout(&response).await?;
 
         // Send initialized event
-        let initialized_event = serde_json::json!({
+        let initialized_event = json!({
             "seq": self.next_seq(),
             "type": "event",
             "event": "initialized"
         });
-        self.send_to_client(&initialized_event).await?;
+        send_dap_message_stdout(&initialized_event).await?;
 
         // Send runInTerminal request
-        let run_in_terminal = serde_json::json!({
+        let run_in_terminal = json!({
             "seq": self.next_seq(),
             "type": "request",
             "command": "runInTerminal",
@@ -115,135 +118,72 @@ impl DapShim {
                 "env": {}
             }
         });
-        self.send_to_client(&run_in_terminal).await?;
+        send_dap_message_stdout(&run_in_terminal).await?;
 
+        // Buffer the initialize request to forward to subdap
+        self.buffered_requests.push_back(request);
+        
         self.initialized = true;
-
-        // Start connecting to subdap
-        tokio::spawn(async move {
-            // Give the subprocess time to start
-            sleep(Duration::from_secs(2)).await;
-            // Connection will be established in connect_to_subdap
-        });
-
         Ok(())
     }
 
-    async fn connect_to_subdap(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Try to connect to the subdap server
-        // You may need to adjust the port based on your subdap configuration
-        for _ in 0..10 {
-            match TcpStream::connect("127.0.0.1:4712").await {
-                Ok(stream) => {
-                    self.subdap_stream = Some(stream);
-                    println!("Connected to subdap");
-                    
-                    // Forward buffered requests
-                    while let Some(req) = self.buffered_requests.pop_front() {
-                        self.forward_to_subdap(&req).await?;
-                    }
-                    
-                    return Ok(());
-                }
-                Err(_) => {
-                    sleep(Duration::from_millis(500)).await;
-                }
-            }
-        }
-        Err("Failed to connect to subdap".into())
-    }
+    async fn handle_request(
+        &mut self,
+        request: Value,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let command = request["command"].as_str().unwrap_or("");
 
-    async fn forward_to_subdap(&mut self, req: &Request) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(stream) = &mut self.subdap_stream {
-            let req_bytes = serde_json::to_vec(req)?;
-            stream
-                .write_all(format!("Content-Length: {}\r\n\r\n", req_bytes.len()).as_bytes())
-                .await?;
-            stream.write_all(&req_bytes).await?;
-            stream.flush().await?;
-        }
-        Ok(())
-    }
-
-    async fn handle_request(&mut self, req: Request) -> Result<(), Box<dyn std::error::Error>> {
-        match req.command.as_str() {
+        match command {
             "initialize" => {
-                self.handle_initialize(req).await?;
+                self.handle_initialize(request).await?;
             }
             _ => {
                 // Buffer or forward the request
-                if self.subdap_stream.is_none() {
-                    self.buffered_requests.push_back(req);
-                    // Try to connect if we haven't already
-                    if self.initialized {
-                        let _ = self.connect_to_subdap().await;
-                    }
+                if self.subdap_writer.is_none() {
+                    self.buffered_requests.push_back(request);
                 } else {
-                    self.forward_to_subdap(&req).await?;
+                    self.send_to_subdap(&request).await?;
                 }
             }
         }
         Ok(())
     }
-}
 
-async fn proxy_subdap_to_client(
-    shim: Arc<Mutex<DapShim>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        sleep(Duration::from_millis(100)).await;
-        
-        let mut shim = shim.lock().await;
-        if let Some(stream) = &mut shim.subdap_stream {
-            let mut buf = vec![0u8; 1024];
-            match stream.try_read(&mut buf) {
-                Ok(0) => continue,
-                Ok(n) => {
-                    // Parse and forward the response
-                    // This is simplified - you'd need proper DAP message parsing
-                    if let Ok(msg) = serde_json::from_slice::<Value>(&buf[..n]) {
-                        shim.send_to_client(&msg).await?;
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
+    async fn flush_buffered_requests(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        while let Some(req) = self.buffered_requests.pop_front() {
+            self.send_to_subdap(&req).await?;
         }
+        Ok(())
     }
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    shim: Arc<Mutex<DapShim>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (reader, writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+async fn send_dap_message_stdout(
+    msg: &Value,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let msg_bytes = serde_json::to_vec(msg)?;
+    let mut stdout = stdout();
+    stdout
+        .write_all(format!("Content-Length: {}\r\n\r\n", msg_bytes.len()).as_bytes())
+        .await?;
+    stdout.write_all(&msg_bytes).await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+async fn read_dap_message(
+    reader: &mut BufReader<impl AsyncReadExt + Unpin>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let mut headers = String::new();
 
-    // Store the writer in the shim
-    {
-        let mut shim_lock = shim.lock().await;
-        shim_lock.client_writer = Some(writer);
-    }
-
-    // Start subdap proxy task
-    let shim_clone = shim.clone();
-    tokio::spawn(async move {
-        if let Err(e) = proxy_subdap_to_client(shim_clone).await {
-            eprintln!("Subdap proxy error: {}", e);
-        }
-    });
-
+    // Read headers
     loop {
         headers.clear();
-
-        // Read headers
         loop {
             let bytes_read = reader.read_line(&mut headers).await?;
             if bytes_read == 0 {
-                return Ok(()); // Connection closed
+                return Err("Connection closed".into());
             }
             if headers.ends_with("\r\n\r\n") {
                 break;
@@ -263,27 +203,107 @@ async fn handle_connection(
         reader.read_exact(&mut body).await?;
 
         // Parse request
-        let req: Request = serde_json::from_slice(&body)?;
+        let msg: Value = serde_json::from_slice(&body)?;
+        return Ok(msg);
+    }
+}
 
-        // Handle request
+async fn subdap_connect_and_proxy(shim: Arc<Mutex<DapShim>>) {
+    // Try to connect to subdap
+    let mut attempts = 0;
+    let stream = loop {
+        attempts += 1;
+        match TcpStream::connect("127.0.0.1:4712").await {
+            Ok(s) => break s,
+            Err(_) if attempts < 20 => {
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to connect to subdap after {} attempts: {}",
+                    attempts, e
+                );
+                return;
+            }
+        }
+    };
+
+    eprintln!("Connected to subdap on port 4712");
+    let (reader, writer) = stream.into_split();
+
+    // Store writer and flush buffered requests
+    {
         let mut shim_lock = shim.lock().await;
-        shim_lock.handle_request(req).await?;
+        shim_lock.subdap_writer = Some(writer);
+        if let Err(e) = shim_lock.flush_buffered_requests().await {
+            eprintln!("Error flushing buffered requests: {}", e);
+        }
+    }
+
+    // Proxy responses from subdap to stdout
+    let mut reader = BufReader::new(reader);
+    loop {
+        match read_dap_message(&mut reader).await {
+            Ok(msg) => {
+                // Skip initialize response from subdap since we already responded
+                if msg.get("type") == Some(&json!("response")) 
+                    && msg.get("command") == Some(&json!("initialize")) {
+                    continue;
+                }
+                
+                if let Err(e) = send_dap_message_stdout(&msg).await {
+                    eprintln!("Error forwarding to stdout: {}", e);
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("Error reading from subdap: {}", e);
+                break;
+            }
+        }
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:4711").await?;
-    println!("DAP shim listening on 127.0.0.1:4711");
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let shim = Arc::new(Mutex::new(DapShim::new()));
+
+    // Spawn task to connect to subdap once initialized
+    let shim_clone = shim.clone();
+    tokio::spawn(async move {
+        // Wait for initialization
+        loop {
+            {
+                let shim_lock = shim_clone.lock().await;
+                if shim_lock.initialized {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        subdap_connect_and_proxy(shim_clone).await;
+    });
+
+    // Read requests from stdin
+    let stdin = stdin();
+    let mut reader = BufReader::new(stdin);
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        let shim = Arc::new(Mutex::new(DapShim::new()));
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, shim).await {
-                eprintln!("Connection error: {}", e);
+        match read_dap_message(&mut reader).await {
+            Ok(msg) => {
+                let mut shim_lock = shim.lock().await;
+                if let Err(e) = shim_lock.handle_request(msg).await {
+                    eprintln!("Error handling request: {}", e);
+                }
             }
-        });
+            Err(e) => {
+                eprintln!("Error reading from stdin: {}", e);
+                break;
+            }
+        }
     }
+
+    Ok(())
 }
