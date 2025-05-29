@@ -114,7 +114,7 @@ impl DapShim {
                 "kind": "integrated",
                 "title": "Debug Process",
                 "cwd": ".",
-                "args": ["TODO: Fill in subprocess args here"],
+                "args": ["dlv", "dap", "--listen",  "127.0.0.1:4712"],
                 "env": {}
             }
         });
@@ -122,7 +122,7 @@ impl DapShim {
 
         // Buffer the initialize request to forward to subdap
         self.buffered_requests.push_back(request);
-        
+
         self.initialized = true;
         Ok(())
     }
@@ -247,11 +247,12 @@ async fn subdap_connect_and_proxy(shim: Arc<Mutex<DapShim>>) {
         match read_dap_message(&mut reader).await {
             Ok(msg) => {
                 // Skip initialize response from subdap since we already responded
-                if msg.get("type") == Some(&json!("response")) 
-                    && msg.get("command") == Some(&json!("initialize")) {
+                if msg.get("type") == Some(&json!("response"))
+                    && msg.get("command") == Some(&json!("initialize"))
+                {
                     continue;
                 }
-                
+
                 if let Err(e) = send_dap_message_stdout(&msg).await {
                     eprintln!("Error forwarding to stdout: {}", e);
                     break;
