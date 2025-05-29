@@ -12,6 +12,7 @@
 //! - Forwards all subsequent requests to subprocess DAP via TCP on port 4712
 //! - Proxies responses back from subprocess to client
 
+use anyhow::Context;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -26,15 +27,17 @@ struct DapShim {
     subdap_writer: Option<tokio::net::tcp::OwnedWriteHalf>,
     buffered_requests: VecDeque<Value>,
     initialized: bool,
+    subinstance_config: DelveSubinstanceConfiguration,
 }
 
 impl DapShim {
-    fn new() -> Self {
+    fn new(subinstance_config: DelveSubinstanceConfiguration) -> Self {
         Self {
             seq: 0,
             subdap_writer: None,
             buffered_requests: VecDeque::new(),
             initialized: false,
+            subinstance_config,
         }
     }
 
@@ -105,6 +108,7 @@ impl DapShim {
         });
         send_dap_message_stdout(&initialized_event).await?;
 
+        let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
         // Send runInTerminal request
         let run_in_terminal = json!({
             "seq": self.next_seq(),
@@ -112,9 +116,9 @@ impl DapShim {
             "command": "runInTerminal",
             "arguments": {
                 "kind": "integrated",
-                "title": "Debug Process",
-                "cwd": ".",
-                "args": ["dlv", "dap", "--listen",  "127.0.0.1:4712"],
+                "title": "Delve Debug Terminal",
+                "cwd": cwd,
+                "args": self.subinstance_config.args,
                 "env": {}
             }
         });
@@ -211,9 +215,10 @@ async fn read_dap_message(
 async fn subdap_connect_and_proxy(shim: Arc<Mutex<DapShim>>) {
     // Try to connect to subdap
     let mut attempts = 0;
+    let address = shim.lock().await.subinstance_config.address.clone();
     let stream = loop {
         attempts += 1;
-        match TcpStream::connect("127.0.0.1:4712").await {
+        match TcpStream::connect(&*address).await {
             Ok(s) => break s,
             Err(_) if attempts < 20 => {
                 sleep(Duration::from_millis(500)).await;
@@ -229,7 +234,7 @@ async fn subdap_connect_and_proxy(shim: Arc<Mutex<DapShim>>) {
         }
     };
 
-    eprintln!("Connected to subdap on port 4712");
+    eprintln!("Connected to subdap on {address}");
     let (reader, writer) = stream.into_split();
 
     // Store writer and flush buffered requests
@@ -266,9 +271,30 @@ async fn subdap_connect_and_proxy(shim: Arc<Mutex<DapShim>>) {
     }
 }
 
+#[derive(Debug)]
+struct DelveSubinstanceConfiguration {
+    args: Vec<String>,
+    address: Arc<str>,
+}
+
+impl DelveSubinstanceConfiguration {
+    fn new(args: Vec<String>) -> anyhow::Result<Self> {
+        let address = args
+            .iter()
+            .position(|arg| matches!(arg.as_str(), "--listen" | "-l"))
+            .and_then(|position| args.get(position + 1))
+            .as_deref()
+            .map(|s| Arc::<str>::from(s.as_str()))
+            .context("Did not find listen address in argument list.")?;
+        Ok(DelveSubinstanceConfiguration { args, address })
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let shim = Arc::new(Mutex::new(DapShim::new()));
+async fn main() -> anyhow::Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let subinstance_config = DelveSubinstanceConfiguration::new(args)?;
+    let shim = Arc::new(Mutex::new(DapShim::new(subinstance_config)));
 
     // Spawn task to connect to subdap once initialized
     let shim_clone = shim.clone();
