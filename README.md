@@ -28,7 +28,3 @@ cargo build --release
 ## Usage
 
 The shim communicates via stdin/stdout and spawns Delve via arguments passed to it via command line. argv[1] is path to the Delve and arg[2..] are passed as arguments.
-
-## License
-
-[License information here]
