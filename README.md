@@ -10,10 +10,10 @@ This DAP shim acts as a middleman between a DAP client and Delve's DAP server. I
 
 - Responds to DAP `initialize` requests with appropriate capabilities
 - Spawns Delve debugger via `runInTerminal` request
-- Buffers requests during Delve startup
+- Buffers requests before/during Delve startup
 - Proxies bidirectional communication between client and Delve
-- Communicates with client via stdin/stdout (standard DAP)
-- Connects to Delve via TCP on port 4712
+- Communicates with client via stdin/stdout
+- Connects to Delve via TCP
 
 ## Compatibility
 
