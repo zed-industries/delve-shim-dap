@@ -13,13 +13,13 @@
 //! - Proxies responses back from subprocess to client
 
 use anyhow::Context;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin, stdout};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug)]
 struct DapShim {
@@ -140,6 +140,13 @@ impl DapShim {
         match command {
             "initialize" => {
                 self.handle_initialize(request).await?;
+            }
+            "runInTerminal"
+                if request
+                    .get("type")
+                    .is_some_and(|t| t.as_str().is_some_and(|s| s == "response")) =>
+            {
+                // No-op, as this is a response to the request we've issued.
             }
             _ => {
                 // Buffer or forward the request
