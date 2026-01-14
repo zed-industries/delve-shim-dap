@@ -6,12 +6,11 @@
 //!
 //! Key features:
 //! - Communicates with client via stdin/stdout
-//! - Responds to initialize request with minimal DAP capabilities
-//! - Sends initialized event and runInTerminal request to spawn subprocess
+//! - Sends runInTerminal reverse request to spawn the Delve subprocess
 //! - Buffers requests that arrive before subprocess is ready
-//! - Forwards all subsequent requests to subprocess DAP via TCP
-//! - When receiving Delve's initialize response, sends a capabilities event to update the client
-//! - Proxies responses back from subprocess to client
+//! - Forwards all requests to subprocess DAP via TCP
+//! - Forwards Delve's initialize response with actual capabilities directly to client
+//! - Proxies all responses back from subprocess to client
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -66,33 +65,8 @@ impl DapShim {
         &mut self,
         request: Value,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let seq = request["seq"].as_i64().unwrap_or(0);
-
-        // Send a minimal initialize response. The real capabilities will be sent
-        // via a "capabilities" event once we receive them from Delve.
-        let response = json!({
-            "seq": self.next_seq(),
-            "type": "response",
-            "request_seq": seq,
-            "success": true,
-            "command": "initialize",
-            "body": {
-                "supportsConfigurationDoneRequest": true
-            }
-        });
-
-        send_dap_message_stdout(&response).await?;
-
-        // Send initialized event
-        let initialized_event = json!({
-            "seq": self.next_seq(),
-            "type": "event",
-            "event": "initialized"
-        });
-        send_dap_message_stdout(&initialized_event).await?;
-
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
-        // Send runInTerminal request
+        // Send runInTerminal reverse request to spawn Delve
         let run_in_terminal = json!({
             "seq": self.next_seq(),
             "type": "request",
@@ -107,7 +81,8 @@ impl DapShim {
         });
         send_dap_message_stdout(&run_in_terminal).await?;
 
-        // Buffer the initialize request to forward to subdap
+        // Buffer the initialize request to forward to Delve - we'll send back
+        // Delve's actual capabilities in its initialize response
         self.buffered_requests.push_back(request);
 
         self.initialized = true;
@@ -241,39 +216,8 @@ async fn subdap_connect_and_proxy(shim: Arc<Mutex<DapShim>>) {
     loop {
         match read_dap_message(&mut reader).await {
             Ok(msg) => {
-                // When we receive the initialize response from Delve, convert it to a
-                // capabilities event so the client gets Delve's real capabilities
-                // (including exceptionBreakpointFilters).
-                if msg.get("type") == Some(&json!("response"))
-                    && msg.get("command") == Some(&json!("initialize"))
-                {
-                    if let Some(body) = msg.get("body") {
-                        let seq = {
-                            let mut shim_lock = shim.lock().await;
-                            shim_lock.next_seq()
-                        };
-                        let capabilities_event = json!({
-                            "seq": seq,
-                            "type": "event",
-                            "event": "capabilities",
-                            "body": {
-                                "capabilities": body
-                            }
-                        });
-                        if let Err(e) = send_dap_message_stdout(&capabilities_event).await {
-                            eprintln!("Error sending capabilities event: {}", e);
-                        }
-                    }
-                    continue;
-                }
-
-                // Skip the second initialized event from Delve since we already sent one
-                if msg.get("type") == Some(&json!("event"))
-                    && msg.get("event") == Some(&json!("initialized"))
-                {
-                    continue;
-                }
-
+                // Forward all messages from Delve directly to the client,
+                // including the initialize response with Delve's actual capabilities
                 if let Err(e) = send_dap_message_stdout(&msg).await {
                     eprintln!("Error forwarding to stdout: {}", e);
                     break;
