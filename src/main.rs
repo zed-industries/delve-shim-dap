@@ -6,10 +6,11 @@
 //!
 //! Key features:
 //! - Communicates with client via stdin/stdout
-//! - Responds to initialize request with DAP capabilities
+//! - Responds to initialize request with minimal DAP capabilities
 //! - Sends initialized event and runInTerminal request to spawn subprocess
 //! - Buffers requests that arrive before subprocess is ready
-//! - Forwards all subsequent requests to subprocess DAP via TCP on port 4712
+//! - Forwards all subsequent requests to subprocess DAP via TCP
+//! - When receiving Delve's initialize response, sends a capabilities event to update the client
 //! - Proxies responses back from subprocess to client
 
 use anyhow::Context;
@@ -67,7 +68,8 @@ impl DapShim {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let seq = request["seq"].as_i64().unwrap_or(0);
 
-        // Send initialize response
+        // Send a minimal initialize response. The real capabilities will be sent
+        // via a "capabilities" event once we receive them from Delve.
         let response = json!({
             "seq": self.next_seq(),
             "type": "response",
@@ -75,26 +77,7 @@ impl DapShim {
             "success": true,
             "command": "initialize",
             "body": {
-                "supportsConfigurationDoneRequest": true,
-                "supportsConditionalBreakpoints": true,
-                "supportsDelayedStackTraceLoading": true,
-                "supportsFunctionBreakpoints": true,
-                "supportsInstructionBreakpoints": true,
-                "supportsExceptionInfoRequest": true,
-                "supportsSetVariable": true,
-                "supportsEvaluateForHovers": true,
-                "supportsClipboardContext": true,
-                "supportsSteppingGranularity": true,
-                "supportsLogPoints": true,
-                "supportsDisassembleRequest": true,
-                "supportsStepBack": false,
-                "supportTerminateDebuggee": false,
-                "supportsTerminateRequest": false,
-                "supportsRestartRequest": false,
-                "supportsSetExpression": false,
-                "supportsLoadedSourcesRequest": false,
-                "supportsReadMemoryRequest": false,
-                "supportsCancelRequest": false
+                "supportsConfigurationDoneRequest": true
             }
         });
 
@@ -258,9 +241,35 @@ async fn subdap_connect_and_proxy(shim: Arc<Mutex<DapShim>>) {
     loop {
         match read_dap_message(&mut reader).await {
             Ok(msg) => {
-                // Skip initialize response from subdap since we already responded
+                // When we receive the initialize response from Delve, convert it to a
+                // capabilities event so the client gets Delve's real capabilities
+                // (including exceptionBreakpointFilters).
                 if msg.get("type") == Some(&json!("response"))
                     && msg.get("command") == Some(&json!("initialize"))
+                {
+                    if let Some(body) = msg.get("body") {
+                        let seq = {
+                            let mut shim_lock = shim.lock().await;
+                            shim_lock.next_seq()
+                        };
+                        let capabilities_event = json!({
+                            "seq": seq,
+                            "type": "event",
+                            "event": "capabilities",
+                            "body": {
+                                "capabilities": body
+                            }
+                        });
+                        if let Err(e) = send_dap_message_stdout(&capabilities_event).await {
+                            eprintln!("Error sending capabilities event: {}", e);
+                        }
+                    }
+                    continue;
+                }
+
+                // Skip the second initialized event from Delve since we already sent one
+                if msg.get("type") == Some(&json!("event"))
+                    && msg.get("event") == Some(&json!("initialized"))
                 {
                     continue;
                 }
