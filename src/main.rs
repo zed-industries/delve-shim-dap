@@ -6,11 +6,11 @@
 //!
 //! Key features:
 //! - Communicates with client via stdin/stdout
-//! - Responds to initialize request with DAP capabilities
-//! - Sends initialized event and runInTerminal request to spawn subprocess
+//! - Sends runInTerminal reverse request to spawn the Delve subprocess
 //! - Buffers requests that arrive before subprocess is ready
-//! - Forwards all subsequent requests to subprocess DAP via TCP on port 4712
-//! - Proxies responses back from subprocess to client
+//! - Forwards all requests to subprocess DAP via TCP
+//! - Forwards Delve's initialize response with actual capabilities directly to client
+//! - Proxies all responses back from subprocess to client
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -65,51 +65,8 @@ impl DapShim {
         &mut self,
         request: Value,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let seq = request["seq"].as_i64().unwrap_or(0);
-
-        // Send initialize response
-        let response = json!({
-            "seq": self.next_seq(),
-            "type": "response",
-            "request_seq": seq,
-            "success": true,
-            "command": "initialize",
-            "body": {
-                "supportsConfigurationDoneRequest": true,
-                "supportsConditionalBreakpoints": true,
-                "supportsDelayedStackTraceLoading": true,
-                "supportsFunctionBreakpoints": true,
-                "supportsInstructionBreakpoints": true,
-                "supportsExceptionInfoRequest": true,
-                "supportsSetVariable": true,
-                "supportsEvaluateForHovers": true,
-                "supportsClipboardContext": true,
-                "supportsSteppingGranularity": true,
-                "supportsLogPoints": true,
-                "supportsDisassembleRequest": true,
-                "supportsStepBack": false,
-                "supportTerminateDebuggee": false,
-                "supportsTerminateRequest": false,
-                "supportsRestartRequest": false,
-                "supportsSetExpression": false,
-                "supportsLoadedSourcesRequest": false,
-                "supportsReadMemoryRequest": false,
-                "supportsCancelRequest": false
-            }
-        });
-
-        send_dap_message_stdout(&response).await?;
-
-        // Send initialized event
-        let initialized_event = json!({
-            "seq": self.next_seq(),
-            "type": "event",
-            "event": "initialized"
-        });
-        send_dap_message_stdout(&initialized_event).await?;
-
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
-        // Send runInTerminal request
+        // Send runInTerminal reverse request to spawn Delve
         let run_in_terminal = json!({
             "seq": self.next_seq(),
             "type": "request",
@@ -124,7 +81,8 @@ impl DapShim {
         });
         send_dap_message_stdout(&run_in_terminal).await?;
 
-        // Buffer the initialize request to forward to subdap
+        // Buffer the initialize request to forward to Delve - we'll send back
+        // Delve's actual capabilities in its initialize response
         self.buffered_requests.push_back(request);
 
         self.initialized = true;
@@ -258,13 +216,8 @@ async fn subdap_connect_and_proxy(shim: Arc<Mutex<DapShim>>) {
     loop {
         match read_dap_message(&mut reader).await {
             Ok(msg) => {
-                // Skip initialize response from subdap since we already responded
-                if msg.get("type") == Some(&json!("response"))
-                    && msg.get("command") == Some(&json!("initialize"))
-                {
-                    continue;
-                }
-
+                // Forward all messages from Delve directly to the client,
+                // including the initialize response with Delve's actual capabilities
                 if let Err(e) = send_dap_message_stdout(&msg).await {
                     eprintln!("Error forwarding to stdout: {}", e);
                     break;
